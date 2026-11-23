@@ -1,0 +1,113 @@
+name: Build OrangeFox (psyche)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fox_branch:
+        description: "OrangeFox sync branch (12.1 recommended)"
+        required: true
+        default: "12.1"
+      device_tree_url:
+        description: "Psyche TWRP/OrangeFox device tree Git URL"
+        required: true
+        default: "https://github.com/sekaiacg/device_xiaomi_alioth-TWRP.git"
+      device_tree_branch:
+        description: "Device tree branch (leave empty for repo default)"
+        required: false
+        default: ""
+      device_path:
+        description: "Target path in source tree (e.g. device/xiaomi/alioth or device/xiaomi/psyche)"
+        required: true
+        default: "device/xiaomi/alioth"
+      build_target:
+        description: "Make target (bootimage for A/B recovery-in-boot)"
+        required: true
+        default: "bootimage"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space on runner
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            aria2 bc bison build-essential ccache cpio curl flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+            liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop pngcrush \
+            python-is-python3 rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Sync OrangeFox sources
+        run: |
+          mkdir -p ~/OrangeFox_sync ~/fox_build
+          git clone https://gitlab.com/OrangeFox/sync.git ~/OrangeFox_sync/sync
+          cd ~/OrangeFox_sync/sync
+          ./orangefox_sync.sh --branch "${{ inputs.fox_branch }}" --path ~/fox_build
+
+      - name: Clone psyche device tree
+        run: |
+          TARGET="$HOME/fox_build/${{ inputs.device_path }}"
+          rm -rf "$TARGET"
+          if [ -n "${{ inputs.device_tree_branch }}" ]; then
+            git clone --depth=1 -b "${{ inputs.device_tree_branch }}" "${{ inputs.device_tree_url }}" "$TARGET"
+          else
+            git clone --depth=1 "${{ inputs.device_tree_url }}" "$TARGET"
+          fi
+
+      - name: Build OrangeFox
+        run: |
+          cd ~/fox_build
+          source "${{ github.workspace }}/fox_vars.sh"
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL="C"
+          lunch twrp_psyche-eng
+          mka adbd "${{ inputs.build_target }}" -j"$(nproc --all)"
+
+      - name: Collect outputs
+        run: |
+          mkdir -p "${{ github.workspace }}/release"
+          OUT_DIR="$HOME/fox_build/out/target/product/psyche"
+          cp -v "$OUT_DIR"/OrangeFox-*.zip "${{ github.workspace }}/release/" || true
+          cp -v "$OUT_DIR"/OrangeFox-*.img "${{ github.workspace }}/release/" || true
+          if [ -f "$OUT_DIR/boot.img" ]; then
+            cp -v "$OUT_DIR/boot.img" "${{ github.workspace }}/release/OrangeFox-psyche-boot.img"
+          fi
+          ls -lh "${{ github.workspace }}/release/"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-psyche
+          path: release/*
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "ofox-psyche-${{ github.run_number }}"
+          name: "OrangeFox psyche #${{ github.run_number }}"
+          files: release/*
